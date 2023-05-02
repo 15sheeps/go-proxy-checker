@@ -1,4 +1,4 @@
-module main
+module github.com/15sheeps/go-proxy-checker
 
 go 1.20
 
