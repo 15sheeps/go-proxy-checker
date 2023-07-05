@@ -2,114 +2,229 @@ package checker
 
 import (
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"context"
 	"h12.io/socks"
 	"sync"
 	"errors"
 	"time"
+	"log"
+	"io"
+	"strings"
 	"bufio"
 	"os"
 	"fmt"
 )
 
-var wg sync.WaitGroup
-
-type ProxyChecker struct {
-	Proxies []*url.URL
-	Timeout int
-	Concurrent int
-	Endpoint string
-	ProxyType string
-}
+var ErrInvalidType = errors.New("Invalid proxy type (http(s)/socks4/socks5 are allowed)")
+var ErrParsingProxy = errors.New("Unable to parse proxy URL")
 
 type ConditionCallback func(r *http.Response) bool
 
-func (p *ProxyChecker) LoadProxies(path string) error {
-	switch p.ProxyType {
-	case "http", "socks4", "socks5":
-		break
-	default:
-		return errors.New("Invalid type of proxy.")
-	}
+type ProxyType int
+const (
+	TypeUnknown ProxyType = iota
+	TypeHTTP
+	TypeHTTPS
+	TypeSOCKS4
+	TypeSOCKS5
+)
 
-	file, err := os.Open(path)
+var PossibleTypes = []ProxyType{
+	TypeHTTP,
+	TypeSOCKS4,
+	TypeSOCKS5,
+}
+
+type Checker struct {
+	Endpoint string
+	Condition ConditionCallback
+	Timeout time.Duration
+	Workers int
+	proxies []Proxy
+	goodProxies []Proxy
+}
+
+type Proxy struct {
+	HostPort string
+	Type ProxyType
+	RequestTime int
+}
+
+func (checker *Checker) LoadFromURL(url string, proxyType ProxyType) error {
+    resp, err := http.Get(url)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    scanner := bufio.NewScanner(resp.Body)
+
+    for scanner.Scan() {
+    	var proxy Proxy
+        proxy.HostPort = scanner.Text()
+        proxy.Type = proxyType
+
+        checker.proxies = append(checker.proxies, proxy)
+    }
+
+    if err := scanner.Err(); err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (checker *Checker) LoadFromFile(path string, proxyType ProxyType) error {
+    file, err := os.Open(path)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    scanner := bufio.NewScanner(file)
+
+    for scanner.Scan() {
+    	var proxy Proxy
+        proxy.HostPort = scanner.Text()
+        proxy.Type = proxyType
+
+        checker.proxies = append(checker.proxies, proxy)
+    }
+
+    if err := scanner.Err(); err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (checker *Checker) ClearProxies() {
+	checker.proxies = nil
+}
+
+func (checker *Checker) check(p Proxy) {
+	switch p.Type {
+	case TypeUnknown:
+		for _, proxyType := range PossibleTypes {
+			pTyped := p
+			pTyped.Type = proxyType
+			checker.checkTyped(pTyped)
+		}
+	default:
+		checker.checkTyped(p)
+	}
+}
+
+func (checker *Checker) CheckProxies() []Proxy {
+	checker.goodProxies = nil
+
+	if checker.Workers <= 0 {checker.Workers = 1}
+
+	feeder := make(chan Proxy, checker.Workers)
+
+    var wg sync.WaitGroup
+    for i := 0; i < checker.Workers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for proxy := range feeder {
+            	checker.check(proxy)
+            }
+        }()
+    }
+
+    for _, proxy := range checker.proxies {
+        feeder <- proxy
+    }
+    close(feeder)
+    wg.Wait()
+
+    return checker.goodProxies
+}
+
+func (p Proxy) ToURL() (*url.URL, error) {
+	var schemedProxy string
+
+	switch p.Type {
+	case TypeHTTP, TypeHTTPS:
+		schemedProxy = "http://" + p.HostPort
+	case TypeSOCKS4:
+		schemedProxy = "socks4://" + p.HostPort
+	case TypeSOCKS5:
+		schemedProxy = "socks5://" + p.HostPort
+	default:
+		return nil, ErrInvalidType
+	}	
+
+	proxyURL, err := url.Parse(schemedProxy)
 	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		proxyUrl := fmt.Sprintf("%s://%s", p.ProxyType, scanner.Text())
-		proxy, err := url.Parse(proxyUrl)
-		if err != nil {
-			continue
-		}
-
-		p.Proxies = append(p.Proxies, proxy)
+		return nil, ErrParsingProxy
 	}
 
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
+	return proxyURL, nil
 }
 
-func (p ProxyChecker) CheckProxies(condition ConditionCallback) (goodProxies []*url.URL) {
-	if p.Concurrent <= 0 {
-		p.Concurrent = 1
+func (checker *Checker) checkTyped(p Proxy) {
+	var t0, t1 time.Time
+
+    req, err := http.NewRequest("GET", checker.Endpoint, nil)
+    if err != nil {
+    	return
+    }
+
+	trace := &httptrace.ClientTrace{
+		GetConn: func(_ string) {
+			t0 = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			t1 = time.Now()
+		},
 	}
 
-    var limit = make(chan struct{}, p.Concurrent)
+	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
 
-	for _, proxy := range p.Proxies {
-		wg.Add(1)
-
-        go func(proxy *url.URL) {
-        	limit <- struct{}{}
-        	if (p.CheckProxy(proxy, condition) == true) {
-        		goodProxies = append(goodProxies, proxy)
-        	}
-
-        	<- limit
-        	wg.Done()
-        }(proxy)
+	proxyURL, err := p.ToURL()
+	if err != nil {
+		return
 	}
 
-    wg.Wait() 
-
-    return goodProxies
-}
-
-func (p ProxyChecker) CheckProxy(proxy *url.URL, condition ConditionCallback) bool {
 	var transport *http.Transport
-	switch p.ProxyType {
-	case "socks4", "socks5":
+	switch p.Type {
+	case TypeHTTP:
 		transport = &http.Transport{
-			Dial: socks.Dial(proxy.String()),
-		}	
-	case "http":
-		transport = &http.Transport{
-			Proxy: http.ProxyURL(proxy),
+			Proxy: http.ProxyURL(proxyURL),
 		}
+	case TypeSOCKS4, TypeSOCKS5:
+		transport = &http.Transport{
+			Dial: socks.Dial(proxyURL.String()),
+		}	
 	default:
-		return false
+		return
 	}
 
 	client := &http.Client{
 		Transport: transport,
-		Timeout: time.Duration(p.Timeout) * time.Second,
+		Timeout: checker.Timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	response, err := client.Get(p.Endpoint)
+	response, err := client.Do(req)
 	if err != nil {
-		return false
+		return
 	}
 
-	result := condition(response)
+	if checker.Condition(response) {
+		goodProxy := p
+		goodProxy.RequestTime = int((t1.Sub(t0)) / time.Millisecond)
+
+		checker.goodProxies = append(checker.goodProxies, goodProxy)
+	}
 
 	response.Body.Close()
 
-	return result
+	return
 }
