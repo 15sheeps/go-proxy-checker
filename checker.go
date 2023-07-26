@@ -1,4 +1,4 @@
-package checker
+package proxychecker
 
 import (
 	"net/http"
@@ -8,7 +8,10 @@ import (
 	"h12.io/socks"
 	"sync"
 	"errors"
-	"time"
+	"time"	
+	"io/ioutil"
+	"crypto/x509"
+	"crypto/tls"	
 	"log"
 	"io"
 	"strings"
@@ -28,6 +31,7 @@ const (
 	TypeHTTP
 	TypeHTTPS
 	TypeSOCKS4
+	TypeSOCKS4A
 	TypeSOCKS5
 )
 
@@ -38,12 +42,15 @@ var PossibleTypes = []ProxyType{
 }
 
 type Checker struct {
+	Workers int
 	Endpoint string
+	UserAgent string
+	CertificatePath string
 	Condition ConditionCallback
 	Timeout time.Duration
-	Workers int
 	proxies []Proxy
 	goodProxies []Proxy
+	caCertPool *x509.CertPool
 }
 
 type Proxy struct {
@@ -118,6 +125,16 @@ func (checker *Checker) check(p Proxy) {
 }
 
 func (checker *Checker) CheckProxies() []Proxy {
+	if checker.CertificatePath != "" {
+	    caCert, err := ioutil.ReadFile(checker.CertificatePath)
+	    if err != nil {
+	        log.Fatalln(err)
+	    }
+
+	    checker.caCertPool = x509.NewCertPool()
+	    checker.caCertPool.AppendCertsFromPEM(caCert)
+	}
+
 	checker.goodProxies = nil
 
 	if checker.Workers <= 0 {checker.Workers = 1}
@@ -150,7 +167,7 @@ func (p Proxy) ToURL() (*url.URL, error) {
 	switch p.Type {
 	case TypeHTTP, TypeHTTPS:
 		schemedProxy = "http://" + p.HostPort
-	case TypeSOCKS4:
+	case TypeSOCKS4, TypeSOCKS4A:
 		schemedProxy = "socks4://" + p.HostPort
 	case TypeSOCKS5:
 		schemedProxy = "socks5://" + p.HostPort
@@ -172,6 +189,10 @@ func (checker *Checker) checkTyped(p Proxy) {
     req, err := http.NewRequest("GET", checker.Endpoint, nil)
     if err != nil {
     	return
+    }
+
+    if checker.UserAgent != "" {
+		req.Header.Set("User-Agent", checker.UserAgent)
     }
 
 	trace := &httptrace.ClientTrace{
@@ -204,12 +225,15 @@ func (checker *Checker) checkTyped(p Proxy) {
 		return
 	}
 
+	transport.DisableKeepAlives = true
+
+	transport.TLSClientConfig = &tls.Config{
+        RootCAs: checker.caCertPool,
+     }
+
 	client := &http.Client{
 		Transport: transport,
 		Timeout: checker.Timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
 	}
 
 	response, err := client.Do(req)
@@ -223,8 +247,6 @@ func (checker *Checker) checkTyped(p Proxy) {
 
 		checker.goodProxies = append(checker.goodProxies, goodProxy)
 	}
-
-	response.Body.Close()
 
 	return
 }
