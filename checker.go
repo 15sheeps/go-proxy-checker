@@ -13,11 +13,8 @@ import (
 	"crypto/x509"
 	"crypto/tls"	
 	"log"
-	"io"
-	"strings"
 	"bufio"
 	"os"
-	"fmt"
 )
 
 var ErrInvalidType = errors.New("Invalid proxy type (http(s)/socks4/socks5 are allowed)")
