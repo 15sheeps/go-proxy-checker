@@ -1,18 +1,31 @@
-
 # go-proxy-checker
 
-Just another simple proxy checker.
+Just another simple package to check proxies concurrently.
 
+## Example
 
-## Usage example
+```go
+package main
 
-```
+import (
+	"time"
+	"net/http"
+	"io"
+	"log"
+	"fmt"
+	"strings"
+	"github.com/15sheeps/go-proxy-checker"
+)
+
 func main() {
-	checker := Checker{
+	checker := &proxychecker.Checker{
 		Timeout: time.Duration(5) * time.Second,
 		Workers: 6000,
 		Endpoint: "https://stackoverflow.com/",
+		UserAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
 		Condition: func (r *http.Response) bool {
+			defer r.Body.Close()
+
 			body, _ := io.ReadAll(r.Body)
 
 			page := string(body)
@@ -21,14 +34,10 @@ func main() {
 		},
 	}
 
-	data := map[string]ProxyType{
-		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt": TypeSOCKS5,
-		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt": TypeSOCKS4,
-		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt": TypeHTTP,
-		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt": TypeHTTPS,
-		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt": TypeHTTP,
-		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt": TypeSOCKS4,
-		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt": TypeSOCKS5,
+	data := map[string]proxychecker.ProxyType{
+		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt": proxychecker.TypeSOCKS5,
+		"https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks4.txt": proxychecker.TypeSOCKS4,
+		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt": proxychecker.TypeHTTPS,
 	}
 
 	for url, proxyType := range data {
@@ -38,7 +47,8 @@ func main() {
 		}
 	}
 	
-	goodProxies := checker.CheckProxies() 
+	goodProxies := checker.CheckProxies()
+	defer checker.ClearProxies()
 
 	for _, proxy := range goodProxies {
 		fmt.Println(proxy.HostPort, fmt.Sprintf("%7dms", proxy.RequestTime))
