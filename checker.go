@@ -2,9 +2,7 @@ package proxychecker
 
 import (
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
-	"context"
 	"h12.io/socks"
 	"sync"
 	"errors"
@@ -17,7 +15,7 @@ import (
 	"os"
 )
 
-var ErrInvalidType = errors.New("Invalid proxy type (http(s)/socks4/socks5 are allowed)")
+var ErrInvalidType = errors.New("Invalid proxy type [http(s)/socks4(a)/socks5 are allowed]")
 var ErrParsingProxy = errors.New("Unable to parse proxy URL")
 
 type ConditionCallback func(r *http.Response) bool
@@ -45,15 +43,14 @@ type Checker struct {
 	CertificatePath string
 	Condition ConditionCallback
 	Timeout time.Duration
-	proxies []Proxy
-	goodProxies []Proxy
+	proxies []proxy
+	goodProxies []*url.URL
 	caCertPool *x509.CertPool
 }
 
-type Proxy struct {
+type proxy struct {
 	HostPort string
 	Type ProxyType
-	RequestTime int
 }
 
 func (checker *Checker) LoadFromURL(url string, proxyType ProxyType) error {
@@ -66,11 +63,11 @@ func (checker *Checker) LoadFromURL(url string, proxyType ProxyType) error {
     scanner := bufio.NewScanner(resp.Body)
 
     for scanner.Scan() {
-    	var proxy Proxy
-        proxy.HostPort = scanner.Text()
-        proxy.Type = proxyType
+    	var p proxy
+        p.HostPort = scanner.Text()
+        p.Type = proxyType
 
-        checker.proxies = append(checker.proxies, proxy)
+        checker.proxies = append(checker.proxies, p)
     }
 
     if err := scanner.Err(); err != nil {
@@ -90,11 +87,11 @@ func (checker *Checker) LoadFromFile(path string, proxyType ProxyType) error {
     scanner := bufio.NewScanner(file)
 
     for scanner.Scan() {
-    	var proxy Proxy
-        proxy.HostPort = scanner.Text()
-        proxy.Type = proxyType
+    	var p proxy
+        p.HostPort = scanner.Text()
+        p.Type = proxyType
 
-        checker.proxies = append(checker.proxies, proxy)
+        checker.proxies = append(checker.proxies, p)
     }
 
     if err := scanner.Err(); err != nil {
@@ -108,7 +105,7 @@ func (checker *Checker) ClearProxies() {
 	checker.proxies = nil
 }
 
-func (checker *Checker) check(p Proxy) {
+func (checker *Checker) check(p proxy) {
 	switch p.Type {
 	case TypeUnknown:
 		for _, proxyType := range PossibleTypes {
@@ -121,7 +118,7 @@ func (checker *Checker) check(p Proxy) {
 	}
 }
 
-func (checker *Checker) CheckProxies() []Proxy {
+func (checker *Checker) CheckProxies() []*url.URL {
 	if checker.CertificatePath != "" {
 	    caCert, err := ioutil.ReadFile(checker.CertificatePath)
 	    if err != nil {
@@ -136,7 +133,7 @@ func (checker *Checker) CheckProxies() []Proxy {
 
 	if checker.Workers <= 0 {checker.Workers = 1}
 
-	feeder := make(chan Proxy, checker.Workers)
+	feeder := make(chan proxy, checker.Workers)
 
     var wg sync.WaitGroup
     for i := 0; i < checker.Workers; i++ {
@@ -158,14 +155,16 @@ func (checker *Checker) CheckProxies() []Proxy {
     return checker.goodProxies
 }
 
-func (p Proxy) ToURL() (*url.URL, error) {
+func (p proxy) ToURL() (*url.URL, error) {
 	var schemedProxy string
 
 	switch p.Type {
 	case TypeHTTP, TypeHTTPS:
 		schemedProxy = "http://" + p.HostPort
-	case TypeSOCKS4, TypeSOCKS4A:
+	case TypeSOCKS4:
 		schemedProxy = "socks4://" + p.HostPort
+	case TypeSOCKS4A:
+		schemedProxy = "socks4a://" + p.HostPort
 	case TypeSOCKS5:
 		schemedProxy = "socks5://" + p.HostPort
 	default:
@@ -180,9 +179,7 @@ func (p Proxy) ToURL() (*url.URL, error) {
 	return proxyURL, nil
 }
 
-func (checker *Checker) checkTyped(p Proxy) {
-	var t0, t1 time.Time
-
+func (checker *Checker) checkTyped(p proxy) {
     req, err := http.NewRequest("GET", checker.Endpoint, nil)
     if err != nil {
     	return
@@ -192,17 +189,6 @@ func (checker *Checker) checkTyped(p Proxy) {
 		req.Header.Set("User-Agent", checker.UserAgent)
     }
 
-	trace := &httptrace.ClientTrace{
-		GetConn: func(_ string) {
-			t0 = time.Now()
-		},
-		GotFirstResponseByte: func() {
-			t1 = time.Now()
-		},
-	}
-
-	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
-
 	proxyURL, err := p.ToURL()
 	if err != nil {
 		return
@@ -210,11 +196,11 @@ func (checker *Checker) checkTyped(p Proxy) {
 
 	var transport *http.Transport
 	switch p.Type {
-	case TypeHTTP:
+	case TypeHTTP, TypeHTTPS:
 		transport = &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
 		}
-	case TypeSOCKS4, TypeSOCKS5:
+	case TypeSOCKS4, TypeSOCKS4A, TypeSOCKS5:
 		transport = &http.Transport{
 			Dial: socks.Dial(proxyURL.String()),
 		}	
@@ -239,10 +225,7 @@ func (checker *Checker) checkTyped(p Proxy) {
 	}
 
 	if checker.Condition(response) {
-		goodProxy := p
-		goodProxy.RequestTime = int((t1.Sub(t0)) / time.Millisecond)
-
-		checker.goodProxies = append(checker.goodProxies, goodProxy)
+		checker.goodProxies = append(checker.goodProxies, proxyURL)
 	}
 
 	return
