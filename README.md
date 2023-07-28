@@ -51,7 +51,7 @@ func main() {
 	defer checker.ClearProxies()
 
 	for _, proxy := range goodProxies {
-		fmt.Println(proxy.HostPort, fmt.Sprintf("%7dms", proxy.RequestTime))
+		fmt.Println(proxy.String())
 	}
 }
 ```
